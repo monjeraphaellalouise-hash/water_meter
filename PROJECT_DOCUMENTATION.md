@@ -16,7 +16,7 @@
 ## 📱 Platform Support
 
 This application runs on:
-- ✅ **iOS** (iPhone/iPad) - Native mobile app
+
 - ✅ **Android** - Native mobile app
 - ✅ **Web Browsers** - Desktop and mobile browsers
 
