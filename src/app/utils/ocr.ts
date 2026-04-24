@@ -1,8 +1,19 @@
+import { Capacitor } from '@capacitor/core';
 import { createWorker, PSM } from 'tesseract.js';
+import { CapacitorPluginMlKitTextRecognition } from '@pantrist/capacitor-plugin-ml-kit-text-recognition';
 
-/**
- * Upscale image for better OCR accuracy
- */
+type DetectionResult = {
+  detected: string | null;
+  confidence: number;
+};
+
+type Strategy = 'light' | 'moderate' | 'aggressive' | 'inverted' | 'sharp' | 'adaptive' | 'extreme';
+
+function stripDataUrlPrefix(imageData: string): string {
+  const commaIndex = imageData.indexOf(',');
+  return commaIndex >= 0 ? imageData.slice(commaIndex + 1) : imageData;
+}
+
 function upscaleImage(canvas: HTMLCanvasElement, scale: number): HTMLCanvasElement {
   const scaledCanvas = document.createElement('canvas');
   scaledCanvas.width = canvas.width * scale;
@@ -18,13 +29,7 @@ function upscaleImage(canvas: HTMLCanvasElement, scale: number): HTMLCanvasEleme
   return scaledCanvas;
 }
 
-/**
- * Advanced preprocessing strategies for different meter types
- */
-function preprocessImage(
-  canvas: HTMLCanvasElement,
-  strategy: 'light' | 'moderate' | 'aggressive' | 'inverted' | 'sharp' | 'adaptive' | 'extreme'
-): HTMLCanvasElement {
+function preprocessImage(canvas: HTMLCanvasElement, strategy: Strategy): HTMLCanvasElement {
   const ctx = canvas.getContext('2d');
   if (!ctx) return canvas;
 
@@ -103,10 +108,7 @@ function preprocessImage(
   return canvas;
 }
 
-/**
- * Clean OCR output into a valid meter reading
- */
-function cleanMeterText(text: string): string | null {
+function normalizeNumericString(text: string): string | null {
   const cleanedText = text.trim().replace(/[^\d.]/g, '');
   if (!cleanedText) return null;
 
@@ -116,28 +118,80 @@ function cleanMeterText(text: string): string | null {
     : cleanedText;
 
   const parsedNumber = parseFloat(normalized);
-
-  if (isNaN(parsedNumber) || parsedNumber < 0 || parsedNumber >= 999999) {
+  if (Number.isNaN(parsedNumber) || parsedNumber < 0 || parsedNumber >= 999999) {
     return null;
   }
 
   return parsedNumber.toFixed(2);
 }
 
-/**
- * Extract meter reading from photo using OCR with multiple strategies
- */
-export async function detectMeterReading(
-  imageData: string
-): Promise<{
-  detected: string | null;
-  confidence: number;
-}> {
+function collectNumericCandidates(text: string): string[] {
+  const tokens = text.match(/\d+(?:\.\d+)?/g) ?? [];
+  const normalized = tokens
+    .map(normalizeNumericString)
+    .filter((value): value is string => Boolean(value));
+
+  return Array.from(new Set(normalized));
+}
+
+function pickBestCandidate(candidates: string[]): string | null {
+  if (candidates.length === 0) return null;
+
+  const sorted = [...candidates].sort((left, right) => {
+    const leftDigits = left.replace('.', '').length;
+    const rightDigits = right.replace('.', '').length;
+    if (rightDigits !== leftDigits) return rightDigits - leftDigits;
+    return parseFloat(right) - parseFloat(left);
+  });
+
+  return sorted[0] ?? null;
+}
+
+async function detectWithMlKit(imageData: string): Promise<DetectionResult> {
+  if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') {
+    return { detected: null, confidence: 0 };
+  }
+
+  try {
+    const base64Image = stripDataUrlPrefix(imageData);
+    const result = await CapacitorPluginMlKitTextRecognition.detectText({
+      base64Image,
+      rotation: 0,
+    });
+
+    const texts: string[] = [result.text];
+
+    for (const block of result.blocks ?? []) {
+      texts.push(block.text);
+      for (const line of block.lines ?? []) {
+        texts.push(line.text);
+        for (const element of line.elements ?? []) {
+          texts.push(element.text);
+        }
+      }
+    }
+
+    const candidates = texts.flatMap(collectNumericCandidates);
+    const detected = pickBestCandidate(candidates);
+
+    if (!detected) {
+      return { detected: null, confidence: 0 };
+    }
+
+    return {
+      detected,
+      confidence: 92,
+    };
+  } catch (error) {
+    console.warn('ML Kit OCR failed, falling back to Tesseract:', error);
+    return { detected: null, confidence: 0 };
+  }
+}
+
+async function detectWithTesseract(imageData: string): Promise<DetectionResult> {
   let worker: Awaited<ReturnType<typeof createWorker>> | null = null;
 
   try {
-    console.log('🔍 Starting advanced multi-strategy OCR detection...');
-
     const img = new Image();
     await new Promise<void>((resolve, reject) => {
       img.onload = () => resolve();
@@ -146,14 +200,14 @@ export async function detectMeterReading(
     });
 
     worker = await createWorker('eng', 1, {
-      logger: (m) => {
-        if (m.status === 'recognizing text') {
-          console.log(`OCR Progress: ${Math.round(m.progress * 100)}%`);
+      logger: (message) => {
+        if (message.status === 'recognizing text') {
+          console.log(`OCR Progress: ${Math.round(message.progress * 100)}%`);
         }
       },
     });
 
-    const strategies = [
+    const strategies: Strategy[] = [
       'light',
       'moderate',
       'aggressive',
@@ -161,7 +215,7 @@ export async function detectMeterReading(
       'sharp',
       'adaptive',
       'extreme',
-    ] as const;
+    ];
 
     const psmModes: PSM[] = [
       PSM.AUTO,
@@ -176,17 +230,12 @@ export async function detectMeterReading(
     const allResults: Array<{
       number: string;
       confidence: number;
-      strategy: typeof strategies[number];
-      psm: PSM;
-      scale: number;
     }> = [];
 
     for (const scale of scales) {
       for (const strategy of strategies) {
         for (const psm of psmModes) {
           try {
-            console.log(`🔄 Trying: strategy=${strategy}, psm=${psm}, scale=${scale}x`);
-
             const canvas = document.createElement('canvas');
             canvas.width = img.width;
             canvas.height = img.height;
@@ -207,62 +256,49 @@ export async function detectMeterReading(
             await worker.setParameters({
               tessedit_pageseg_mode: psm as unknown as string,
               tessedit_char_whitelist: '0123456789.',
-            } as any);
+            } as never);
 
             const { data } = await worker.recognize(processedData);
+            const candidates = collectNumericCandidates(data.text);
+            const detected = pickBestCandidate(candidates);
 
-            console.log(`Raw: "${data.text.trim()}" (conf: ${data.confidence.toFixed(1)}%)`);
-
-            const formatted = cleanMeterText(data.text);
-
-            if (formatted) {
+            if (detected) {
               allResults.push({
-                number: formatted,
+                number: detected,
                 confidence: data.confidence,
-                strategy,
-                psm,
-                scale,
               });
-
-              console.log(`✅ Valid: ${formatted}`);
             }
-          } catch (e) {
-            console.log('❌ Failed:', e);
+          } catch (error) {
+            console.log('Tesseract strategy failed:', error);
           }
         }
       }
     }
 
-    if (allResults.length > 0) {
-      allResults.sort((a, b) => b.confidence - a.confidence);
-
-      const best = allResults[0];
-
-      console.log(`🎯 BEST DETECTION: ${best.number}`);
-      console.log(`Confidence: ${best.confidence.toFixed(1)}%`);
-      console.log(`Strategy: ${best.strategy}, PSM: ${best.psm}, Scale: ${best.scale}x`);
-      console.log('Top 5 results:', allResults.slice(0, 5));
-
-      return {
-        detected: best.number,
-        confidence: best.confidence,
-      };
+    if (allResults.length === 0) {
+      return { detected: null, confidence: 0 };
     }
 
-    console.log('❌ No valid detections from any strategy');
+    allResults.sort((left, right) => right.confidence - left.confidence);
     return {
-      detected: null,
-      confidence: 0,
+      detected: allResults[0].number,
+      confidence: allResults[0].confidence,
     };
   } catch (error) {
-    console.error('❌ OCR Error:', error);
-    return {
-      detected: null,
-      confidence: 0,
-    };
+    console.error('Tesseract OCR Error:', error);
+    return { detected: null, confidence: 0 };
   } finally {
     if (worker) {
       await worker.terminate();
     }
   }
+}
+
+export async function detectMeterReading(imageData: string): Promise<DetectionResult> {
+  const nativeResult = await detectWithMlKit(imageData);
+  if (nativeResult.detected) {
+    return nativeResult;
+  }
+
+  return detectWithTesseract(imageData);
 }

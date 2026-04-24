@@ -22,3 +22,6 @@ project(':capacitor-splash-screen').projectDir = new File('../node_modules/@capa
 
 include ':capacitor-status-bar'
 project(':capacitor-status-bar').projectDir = new File('../node_modules/@capacitor/status-bar/android')
+
+include ':pantrist-capacitor-plugin-ml-kit-text-recognition'
+project(':pantrist-capacitor-plugin-ml-kit-text-recognition').projectDir = new File('../node_modules/@pantrist/capacitor-plugin-ml-kit-text-recognition/android')
